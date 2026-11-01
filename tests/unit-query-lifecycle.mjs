@@ -627,3 +627,27 @@ it("an unexpected session id ends the turn, commits nothing, and is fatal", asyn
 	assert.ok(!lines.includes("survived"));
 	assert.match(stderr, /unexpected session wrong-session/);
 });
+
+it("AskClaude waits on a writer that starts stopping while a reloaded module cold-imports the SDK", { timeout: 5000 }, async () => {
+	const ask = user("tool"), controller = new AbortController();
+	scripts.push({ tool: true, deferTool: true, late: true });
+	const tool = await call([ask], controller.signal).result();
+	const fresh = await import(`../src/index.js?cold-ask=${Date.now()}`);
+	fresh.default({ on() {}, registerProvider() {}, registerTool() {} });
+	let ready, release;
+	const entered = new Promise((resolve) => { ready = resolve; });
+	const loading = new Promise((resolve) => { release = resolve; });
+	fresh.__test.setSdkLoader(() => { ready(); return loading; });
+	scripts.push({});
+	const waiting = fresh.__test.promptAndWait("advise", "none", new Map(), undefined, {
+		model: model.id, appendSkills: false, context: [ask, tool, toolResult], piSessionId: "pi",
+	}).then((output) => ({ output }), (error) => ({ error }));
+	await entered;
+	controller.abort();
+	release({ query: fakeQuery });
+	const { output, error } = await waiting;
+	assert.equal(error, undefined, error?.message);
+	assert.equal(output.responseText, "answer");
+	assert.equal(calls.length, 2);
+	assert.notEqual(calls[0].child.exitCode, null, "the source writer exited before AskClaude resumed its transcript");
+});

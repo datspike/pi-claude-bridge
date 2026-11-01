@@ -2442,8 +2442,8 @@ async function promptAndWait(
 	// its file. Same-model calls fork the last valid boundary; other models import.
 	const askClaudeSessionId = options?.piSessionId ?? null;
 	const traceQueryId = traceId("askclaude");
-	await waitForSessionWriter(sessionStateFor(askClaudeSessionId)?.ccSessionId, signal);
 	const sdkQueryFactory = await getQuery(signal);
+	await waitForSessionWriter(sessionStateFor(askClaudeSessionId)?.ccSessionId, signal);
 	const contextWithPrompt = [...(options?.context ?? []), { role: "user" as const, content: prompt, timestamp: Date.now() }];
 	const sync = syncSharedSession(contextWithPrompt, cwd, undefined, cliModel, options?.isolated ? null : askClaudeSessionId, traceQueryId, false, !options?.isolated);
 	const resumeSessionId = sync.sessionId;
