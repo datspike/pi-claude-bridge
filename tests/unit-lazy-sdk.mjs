@@ -11,7 +11,8 @@ const mod = await import("../src/index.js");
 hook.deregister();
 const { __test } = mod;
 let provider;
-mod.default({ on: () => {}, registerTool: () => {}, registerProvider: (_id, value) => { provider = value; } });
+const handlers = {};
+mod.default({ on: (name, fn) => { (handlers[name] ??= []).push(fn); }, registerTool: () => {}, registerProvider: (_id, value) => { provider = value; } });
 const model = provider.models[0];
 let serial = 0;
 let calls;
@@ -139,4 +140,19 @@ it("a fresh request replacing the same session during cold import does not launc
 	assertOk(await replacement.result);
 	await tick();
 	assert.equal(calls.length, 1, "only the replacement may start Claude");
+});
+
+it("closing a session during cold import prevents its launch without cancelling another session", { timeout: 5000 }, async () => {
+	const loading = holdImport();
+	const closed = start("provider", undefined, "closed-during-import");
+	await loading.started;
+	const sibling = start("provider", undefined, "unrelated-session");
+	for (const fn of handlers.session_shutdown) fn({}, { sessionManager: { getSessionId: () => "closed-during-import" } });
+	const { output } = await closed.result;
+	assert.equal(output.stopReason, "error");
+	assert.match(output.errorMessage, /Conversation replaced/);
+	loading.release();
+	assertOk(await sibling.result);
+	await tick();
+	assert.equal(calls.length, 1, "only the other session may launch");
 });

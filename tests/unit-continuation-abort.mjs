@@ -50,13 +50,13 @@ const toolResult = (id) => ({ role: "toolResult", toolCallId: id, toolName: "rea
 const tools = [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }];
 const settle = () => new Promise((r) => setTimeout(r, 20));
 
-let closes;
+let closes, defaultQuery;
 beforeEach(() => {
 	resetSharedSession();
 	activeQueryContexts.clear();
 	closes = 0;
 	// Parks at a tool call, then, once the result is in, streams text until killed.
-	setQuery(({ prompt, options }) => {
+	defaultQuery = ({ prompt, options }) => {
 		let onClose;
 		const killed = new Promise((r) => { onClose = r; });
 		const gen = (async function* () {
@@ -70,10 +70,11 @@ beforeEach(() => {
 		gen.interrupt = async () => {};
 		gen.close = () => { closes++; onClose(); };
 		return gen;
-	});
+	};
+	setQuery(defaultQuery);
 });
 
-afterEach(() => setQuery(null));
+afterEach(() => { setQuery(null); mod.__test.setSdkLoader(null); });
 
 async function parkThenContinue(secondSignal, sid = "pi-continued") {
 	const ask = user("read a");
@@ -133,4 +134,18 @@ describe("abort on a run that continues a parked query", () => {
 
 		assert.equal(closes, 0, "the parked query survives");
 	});
+});
+
+it("continuation abort remains bound after the opening turn cold-loads the SDK", async () => {
+	let imports = 0;
+	setQuery(null);
+	mod.__test.setSdkLoader(async () => { imports++; return { query: defaultQuery }; });
+	const controller = new AbortController();
+	const second = await parkThenContinue(controller.signal, "cold-continued");
+	await settle();
+	controller.abort();
+	const reply = await second.result();
+	assert.equal(reply.stopReason, "aborted");
+	assert.equal(imports, 1, "the parked query continues without another import");
+	assert.ok(closes >= 1);
 });
