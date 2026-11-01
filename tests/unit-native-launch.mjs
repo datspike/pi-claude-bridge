@@ -6,7 +6,6 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { digestMessages } from "../src/message-digests.js";
 const mod = await import("../src/index.js");
 const { __test } = mod;
@@ -26,6 +25,7 @@ for (const file of ["settings.json", "settings.local.json"]) {
 	}));
 }
 const requests = [], launches = [], env = {};
+let sdkImports = 0;
 const server = createServer(async (request, response) => {
 	const chunks = [];
 	for await (const chunk of request) chunks.push(chunk);
@@ -53,10 +53,14 @@ before(async () => {
 	for (const [key, value] of Object.entries(env)) process.env[key] = value;
 	for (const id of ["pi-native", "pi-ask"]) for (const fn of handlers.session_start) fn({}, { cwd, sessionManager: { getSessionId: () => id } });
 	__test.resetSharedSession();
-	__test.setQuery((params) => { launches.push(params.options); return query(params); });
+	__test.setSdkLoader(async () => {
+		sdkImports++;
+		const { query } = await import("@anthropic-ai/claude-agent-sdk");
+		return { query: (params) => { launches.push(params.options); return query(params); } };
+	});
 });
 after(async () => {
-	__test.setQuery(null);
+	__test.setSdkLoader(null);
 	__test.resetSharedSession();
 	for (const key of Object.keys(env)) delete process.env[key];
 	server.closeAllConnections();
@@ -98,5 +102,11 @@ it("native Claude Code accepts import, restart fork, prefix-write and AskClaude 
 	assert.equal(launches[3].sessionId, undefined, "AskClaude's import resumes its written id");
 	assert.ok(launches[3].resume);
 	assert.equal(__test.getSharedSession("pi-ask"), null);
+	const summary = await provider.streamSimple(model, { messages: [user("summarize this conversation")], tools: [] },
+		{ sessionId: "pi-summary", cacheRetention: "none" }).result();
+	assert.equal(summary.stopReason, "stop", summary.errorMessage);
+	assert.deepEqual(summary.content.filter((b) => b.type === "text").map((b) => b.text), ["ACK"]);
+	assert.equal(sdkImports, 1, "provider, AskClaude and summary share the cold SDK import");
+	assert.equal(launches.length, 5);
 	assert.equal(existsSync(repoHookRan), false, "a hook from the repo's .claude settings ran");
 });

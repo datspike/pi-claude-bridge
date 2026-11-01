@@ -1,7 +1,7 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, isToolCallEventType, keyHint, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { query, EffortLevel, SDKMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
@@ -568,7 +568,8 @@ async function runIsolatedSummary(
 		const effort = effortForReasoning(model, options?.reasoning);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
 
-		sdkQuery = queryImpl({
+		const sdkQueryFactory = await getQuery(options?.signal);
+		sdkQuery = sdkQueryFactory({
 			prompt: promptText,
 			options: {
 				cwd,
@@ -639,7 +640,8 @@ async function runIsolatedSummary(
 	} catch (err) {
 		const msg = errorMessage(err);
 		debug("runIsolatedSummary threw; pushing terminal error", err);
-		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
+		const reason = options?.signal?.aborted ? "aborted" : "error";
+		stream.push({ type: "error", reason, error: newAssistantOutput(model, "", reason, msg) });
 		stream.end();
 	} finally {
 		options?.signal?.removeEventListener("abort", onAbort);
@@ -817,13 +819,47 @@ function syncSharedSession(
 	return { sessionId: records ? targetSessionId : null, targetSessionId, created: true, recorded, state, writable };
 }
 
-// The SDK's query(), or a test double (see setQuery).
-let queryImpl: typeof query = query;
+// Keep the SDK out of startup for sessions using another provider. All three
+// query paths share one import; a caller's abort must not cancel other waiters.
+let queryImpl: typeof query | undefined;
+let sdkLoader = async (): Promise<{ query: typeof query }> => import("@anthropic-ai/claude-agent-sdk");
+let sdkQueryPromise: Promise<typeof query> | undefined;
+
+/** Share the import, but cancel each caller's wait and guard its eventual launch separately. */
+async function getQuery(signal?: AbortSignal): Promise<typeof query> {
+	if (signal?.aborted) throw new Error("Aborted");
+	let impl = queryImpl;
+	if (!impl) {
+		const loading = sdkQueryPromise ??= sdkLoader().then((sdk) => sdk.query).catch((error) => {
+			sdkQueryPromise = undefined;
+			throw error;
+		});
+		let onAbort: (() => void) | undefined;
+		try {
+			impl = await (signal ? new Promise<typeof query>((resolve, reject) => {
+				onAbort = () => reject(new Error("Aborted"));
+				signal.addEventListener("abort", onAbort, { once: true });
+				loading.then(resolve, reject);
+			}) : loading);
+		} finally {
+			if (onAbort) signal!.removeEventListener("abort", onAbort);
+		}
+	}
+	const sdkQuery = impl;
+	return (params) => {
+		if (signal?.aborted) throw new Error("Aborted");
+		return sdkQuery(params);
+	};
+}
 
 // @internal
 export const __test = {
 	setQuery(fn: typeof query | null) {
-		queryImpl = fn ?? query;
+		queryImpl = fn ?? undefined;
+	},
+	setSdkLoader(fn: typeof sdkLoader | null) {
+		sdkLoader = fn ?? (async () => import("@anthropic-ai/claude-agent-sdk"));
+		sdkQueryPromise = undefined;
 	},
 	resetSharedSession(piSessionId?: string | null) {
 		// No id: full reset (the pre-map semantics — tests start from a blank slate),
@@ -2045,6 +2081,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	activeQueryContexts.add(queryCtx);
 	let createdBeforeLaunch: { id: string; cwd: string } | undefined;
 	void (async () => {
+		const sdkQueryFactory = await getQuery(options?.signal);
 		await waitForSessionWriter(sessionStateFor(queryCtx.piSessionId)?.ccSessionId, options?.signal);
 		if (queryCtx.discarded) return;
 
@@ -2202,7 +2239,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let wasAborted = false;
 		const stopWriting = () => { sessionWriters.set(syncResult.targetSessionId, childProcess.exited); };
 		let sdkQuery: ReturnType<typeof query>;
-		try { sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions }); }
+		try { sdkQuery = sdkQueryFactory({ prompt: promptStream.stream, options: queryOptions }); }
 		catch (error) {
 			stopWriting();
 			childProcess.terminate();
@@ -2406,6 +2443,7 @@ async function promptAndWait(
 	const askClaudeSessionId = options?.piSessionId ?? null;
 	const traceQueryId = traceId("askclaude");
 	await waitForSessionWriter(sessionStateFor(askClaudeSessionId)?.ccSessionId, signal);
+	const sdkQueryFactory = await getQuery(signal);
 	const contextWithPrompt = [...(options?.context ?? []), { role: "user" as const, content: prompt, timestamp: Date.now() }];
 	const sync = syncSharedSession(contextWithPrompt, cwd, undefined, cliModel, options?.isolated ? null : askClaudeSessionId, traceQueryId, false, !options?.isolated);
 	const resumeSessionId = sync.sessionId;
@@ -2454,7 +2492,7 @@ async function promptAndWait(
 	const childProcess = new QueryProcess(cliDebug.stderr);
 	const stopWriting = () => { sessionWriters.set(sync.targetSessionId, childProcess.exited); };
 	let sdkQuery: ReturnType<typeof query>;
-	try { sdkQuery = queryImpl({
+	try { sdkQuery = sdkQueryFactory({
 		prompt,
 		options: {
 			cwd,
